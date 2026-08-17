@@ -1,0 +1,168 @@
+name: Build ADMIN-NERO SilentDark Handshake Compat
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-silentdark-handshake.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Ant
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ant
+
+      - name: Sparse fetch exact Mobius Interlude base
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none --no-checkout https://gitlab.com/MobiusDevelopment/L2J_Mobius.git upstream
+          git -C upstream sparse-checkout init --cone
+          git -C upstream sparse-checkout set L2J_Mobius_CT_0_Interlude
+          git -C upstream checkout b2537693b1b755aa08745e31a309f38950d6b0ab
+          git -C upstream rev-parse HEAD > official_commit.txt
+
+      - name: Patch exact Silent Dark protected KeyPacket
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = next(Path('upstream/L2J_Mobius_CT_0_Interlude/java').rglob('KeyPacket.java'))
+          p.write_text(r'''/*
+           * ADMIN-NERO 2026 - Silent Dark R2 client compatibility.
+           * Base: L2J Mobius CT0 Interlude, Java 25.
+           * The supplied Silent Dark dsetup.dll decrypts bytes 1..16 of
+           * server packet 0x00 with Blowfish before forwarding to engine.dll.
+           */
+          package org.l2jmobius.gameserver.network.serverpackets;
+
+          import java.security.GeneralSecurityException;
+
+          import javax.crypto.Cipher;
+          import javax.crypto.spec.SecretKeySpec;
+
+          import org.l2jmobius.commons.network.WritableBuffer;
+          import org.l2jmobius.gameserver.network.GameClient;
+          import org.l2jmobius.gameserver.network.ServerPackets;
+
+          public class KeyPacket extends ServerPacket
+          {
+              private static final byte[] SILENT_DARK_KEY =
+              {
+                  (byte) 0x6E, (byte) 0x24, (byte) 0x02, (byte) 0x0F,
+                  (byte) 0xFB, (byte) 0x11, (byte) 0x18, (byte) 0x17,
+                  (byte) 0x12, (byte) 0x2D, (byte) 0x01, (byte) 0x15,
+                  (byte) 0x7A, (byte) 0x10, (byte) 0xFB, (byte) 0x0C
+              };
+
+              private final byte[] _key;
+              private final int _result;
+
+              public KeyPacket(byte[] key, int result)
+              {
+                  _key = key;
+                  _result = result;
+              }
+
+              @Override
+              public void writeImpl(GameClient client, WritableBuffer buffer)
+              {
+                  ServerPackets.KEY_PACKET.writeId(this, buffer);
+
+                  // The dsetup hook decrypts exactly 16 bytes beginning immediately
+                  // after opcode 0x00. Build the normal Interlude bytes that the engine
+                  // must see after dsetup has removed its protection layer:
+                  // [result][key0..key14].
+                  final byte[] plain = new byte[16];
+                  plain[0] = (byte) _result;
+                  System.arraycopy(_key, 0, plain, 1, 15);
+
+                  final byte[] protectedBlock = silentDarkEncrypt(plain);
+                  for (byte b : protectedBlock)
+                  {
+                      buffer.writeByte(b);
+                  }
+
+                  // Byte 16 of the Interlude key is outside the dsetup protected block.
+                  buffer.writeByte(_key[15]);
+                  buffer.writeInt(1);
+                  buffer.writeInt(1);
+              }
+
+              private static byte[] silentDarkEncrypt(byte[] data)
+              {
+                  try
+                  {
+                      // dsetup's Blowfish implementation loads each 32-bit half directly
+                      // from little-endian x86 memory. SunJCE Blowfish uses network/big-endian
+                      // block packing, so reverse every DWORD before and after the cipher.
+                      final byte[] swapped = reverseDwords(data);
+                      final Cipher cipher = Cipher.getInstance("Blowfish/ECB/NoPadding");
+                      cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(SILENT_DARK_KEY, "Blowfish"));
+                      return reverseDwords(cipher.doFinal(swapped));
+                  }
+                  catch (GeneralSecurityException e)
+                  {
+                      throw new IllegalStateException("Unable to build Silent Dark KeyPacket", e);
+                  }
+              }
+
+              private static byte[] reverseDwords(byte[] input)
+              {
+                  final byte[] out = input.clone();
+                  for (int i = 0; i < out.length; i += 4)
+                  {
+                      final byte b0 = out[i];
+                      final byte b1 = out[i + 1];
+                      out[i] = out[i + 3];
+                      out[i + 1] = out[i + 2];
+                      out[i + 2] = b1;
+                      out[i + 3] = b0;
+                  }
+                  return out;
+              }
+          }
+          '''.replace('          ', ''), encoding='utf-8')
+          print(p.read_text())
+          PY
+
+      - name: Build and verify Java 25
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd upstream/L2J_Mobius_CT_0_Interlude
+          ant
+          cd ../..
+          rm -rf out && mkdir -p out/libs
+          unzip -q upstream/build/L2J_Mobius_CT_0_Interlude.zip 'libs/GameServer.jar' -d out
+          cp "$(find upstream/L2J_Mobius_CT_0_Interlude/java -name KeyPacket.java -print -quit)" out/KeyPacket.java
+          cp official_commit.txt out/
+          javap -classpath out/libs/GameServer.jar -verbose org.l2jmobius.gameserver.network.serverpackets.KeyPacket > out/KeyPacket.javap.txt
+          grep -q 'major version: 69' out/KeyPacket.javap.txt
+          sha256sum out/libs/GameServer.jar > out/GameServer.jar.sha256
+
+      - name: Upload compatibility jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-nero-silentdark-handshake-java25
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
