@@ -1,0 +1,84 @@
+name: Build ADMIN-NERO Legacy16 KeyPacket Compat FAST
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-keypacket-legacy16-fast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Ant
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ant
+
+      - name: Sparse fetch exact Mobius Interlude base
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init upstream
+          git -C upstream remote add origin https://gitlab.com/MobiusDevelopment/L2J_Mobius.git
+          git -C upstream sparse-checkout init --cone
+          git -C upstream sparse-checkout set L2J_Mobius_CT_0_Interlude
+          git -C upstream fetch --depth 1 --filter=blob:none origin b2537693b1b755aa08745e31a309f38950d6b0ab
+          git -C upstream checkout --detach FETCH_HEAD
+          git -C upstream rev-parse HEAD | tee official_commit.txt
+
+      - name: Patch exact ADMIN-NERO KeyPacket layout
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('upstream/L2J_Mobius_CT_0_Interlude/java/org/l2jmobius/gameserver/network/serverpackets/KeyPacket.java')
+          s = p.read_text(encoding='utf-8')
+          assert 'for (int i = 0; i < 8; i++)' in s
+          s = s.replace('for (int i = 0; i < 8; i++)', 'for (int i = 0; i < 16; i++)', 1)
+          loop_end = s.index('\n\t\t}', s.index('for (int i = 0; i < 16; i++)'))
+          start = s.index('buffer.writeInt(', loop_end)
+          method_end = s.index('\n\t}', start)
+          s = s[:start] + 'buffer.writeInt(1); // legacy field 1\n\t\tbuffer.writeInt(1); // legacy field 2' + s[method_end:]
+          p.write_text(s, encoding='utf-8', newline='\n')
+          print(s)
+          PY
+
+      - name: Build and verify Java 25
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd upstream/L2J_Mobius_CT_0_Interlude
+          ant
+          cd ../..
+          rm -rf out && mkdir -p out/libs
+          unzip -q upstream/build/L2J_Mobius_CT_0_Interlude.zip 'libs/GameServer.jar' -d out
+          cp upstream/L2J_Mobius_CT_0_Interlude/java/org/l2jmobius/gameserver/network/serverpackets/KeyPacket.java out/KeyPacket.java
+          cp official_commit.txt out/
+          sha256sum out/libs/GameServer.jar | tee out/GameServer.jar.sha256
+          javap -classpath out/libs/GameServer.jar -c -p org.l2jmobius.gameserver.network.serverpackets.KeyPacket | tee out/KeyPacket.javap.txt
+          grep -q 'bipush        16' out/KeyPacket.javap.txt
+          javap -verbose -classpath out/libs/GameServer.jar org.l2jmobius.gameserver.network.serverpackets.KeyPacket | grep 'major version: 69'
+
+      - name: Upload compatibility jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-nero-keypacket-legacy16-java25-fast
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
