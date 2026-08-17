@@ -59,7 +59,7 @@ jobs:
           import javax.crypto.Cipher;
           import javax.crypto.spec.SecretKeySpec;
 
-          import org.l2jmobius.commons.network.WritableBuffer;
+          import org.l2jmobius.commons.network.buffer.WriteBuffer;
           import org.l2jmobius.gameserver.network.GameClient;
           import org.l2jmobius.gameserver.network.ServerPackets;
 
@@ -83,14 +83,13 @@ jobs:
               }
 
               @Override
-              public void writeImpl(GameClient client, WritableBuffer buffer)
+              public void writeImpl(GameClient client, WriteBuffer buffer)
               {
                   ServerPackets.KEY_PACKET.writeId(this, buffer);
 
-                  // The dsetup hook decrypts exactly 16 bytes beginning immediately
-                  // after opcode 0x00. Build the normal Interlude bytes that the engine
-                  // must see after dsetup has removed its protection layer:
-                  // [result][key0..key14].
+                  // dsetup decrypts exactly 16 bytes after opcode 0x00.
+                  // After that layer is removed, engine.dll must see the normal
+                  // Interlude sequence [result][key0..key14].
                   final byte[] plain = new byte[16];
                   plain[0] = (byte) _result;
                   System.arraycopy(_key, 0, plain, 1, 15);
@@ -101,7 +100,8 @@ jobs:
                       buffer.writeByte(b);
                   }
 
-                  // Byte 16 of the Interlude key is outside the dsetup protected block.
+                  // The final key byte and normal legacy trailer are outside the
+                  // 16-byte block transformed by dsetup.dll.
                   buffer.writeByte(_key[15]);
                   buffer.writeInt(1);
                   buffer.writeInt(1);
@@ -111,9 +111,9 @@ jobs:
               {
                   try
                   {
-                      // dsetup's Blowfish implementation loads each 32-bit half directly
-                      // from little-endian x86 memory. SunJCE Blowfish uses network/big-endian
-                      // block packing, so reverse every DWORD before and after the cipher.
+                      // The x86 protection loads Blowfish halves as little-endian
+                      // DWORDs. JCE uses big-endian block packing, hence the DWORD
+                      // reversal around the standard ECB primitive.
                       final byte[] swapped = reverseDwords(data);
                       final Cipher cipher = Cipher.getInstance("Blowfish/ECB/NoPadding");
                       cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(SILENT_DARK_KEY, "Blowfish"));
@@ -157,6 +157,7 @@ jobs:
           cp official_commit.txt out/
           javap -classpath out/libs/GameServer.jar -verbose org.l2jmobius.gameserver.network.serverpackets.KeyPacket > out/KeyPacket.javap.txt
           grep -q 'major version: 69' out/KeyPacket.javap.txt
+          grep -q 'Blowfish/ECB/NoPadding' out/KeyPacket.javap.txt
           sha256sum out/libs/GameServer.jar > out/GameServer.jar.sha256
 
       - name: Upload compatibility jar
