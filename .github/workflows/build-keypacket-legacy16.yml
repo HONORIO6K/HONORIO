@@ -1,0 +1,88 @@
+name: Build ADMIN-NERO Legacy16 KeyPacket Compat
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-keypacket-legacy16.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Ant
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ant
+
+      - name: Fetch exact Mobius base used by ADMIN-NERO FULL
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://gitlab.com/MobiusDevelopment/L2J_Mobius.git upstream
+          git -C upstream checkout b2537693b1b755aa08745e31a309f38950d6b0ab
+          git -C upstream rev-parse HEAD | tee official_commit.txt
+
+      - name: Patch KeyPacket to exact legacy ADMIN-NERO layout
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          files = list(Path('upstream/L2J_Mobius_CT_0_Interlude/java').rglob('KeyPacket.java'))
+          assert len(files) == 1, files
+          p = files[0]
+          s = p.read_text(encoding='utf-8')
+          old_loop = 'for (int i = 0; i < 8; i++)'
+          assert old_loop in s
+          s = s.replace(old_loop, 'for (int i = 0; i < 16; i++)', 1)
+          loop_end = s.index('\n\t\t}', s.index('for (int i = 0; i < 16; i++)'))
+          start = s.index('buffer.writeInt(', loop_end)
+          method_end = s.index('\n\t}', start)
+          replacement = (
+              'buffer.writeInt(1); // legacy ADMIN-NERO field 1\n'
+              '\t\tbuffer.writeInt(1); // legacy ADMIN-NERO field 2'
+          )
+          s = s[:start] + replacement + s[method_end:]
+          p.write_text(s, encoding='utf-8', newline='\n')
+          print(s)
+          PY
+
+      - name: Build patched Java 25 distribution
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd upstream/L2J_Mobius_CT_0_Interlude
+          ant
+          test -f ../build/L2J_Mobius_CT_0_Interlude.zip
+          unzip -tq ../build/L2J_Mobius_CT_0_Interlude.zip
+          cd ../..
+          rm -rf out && mkdir -p out/libs
+          unzip -q upstream/build/L2J_Mobius_CT_0_Interlude.zip 'libs/GameServer.jar' -d out
+          cp "$(find upstream/L2J_Mobius_CT_0_Interlude/java -name KeyPacket.java -print -quit)" out/KeyPacket.java
+          cp official_commit.txt out/
+          sha256sum out/libs/GameServer.jar | tee out/GameServer.jar.sha256
+          javap -classpath out/libs/GameServer.jar -c -p org.l2jmobius.gameserver.network.serverpackets.KeyPacket | tee out/KeyPacket.javap.txt
+          grep -q 'bipush        16' out/KeyPacket.javap.txt
+
+      - name: Upload compatibility jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-nero-keypacket-legacy16-java25
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
